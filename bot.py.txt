@@ -1,0 +1,115 @@
+import discord
+from discord.ext import commands, tasks
+from datetime import datetime
+import json
+import os
+
+intents = discord.Intents.default()
+intents.voice_states = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# 入室時間記録
+join_times = {}
+# 累計通話時間（秒） → JSONに保存
+voice_times = {}
+
+# ★ ランク設定（下限時間[h], 上限時間[h], ロールID）
+RANKS = [
+    (5, 10, 1407387935300390984),   # ロールA
+    (10, 40, 1407388661250785402),  # ロールB
+    (40, 100, 1407388999508820070), # ロールC
+    (100, float("inf"), 1407389326706348052) # ロールD
+]
+
+DATA_FILE = "voice_times.json"
+
+# ================= JSON保存関数 =================
+def save_data():
+    with open(DATA_FILE, "w") as f:
+        json.dump(voice_times, f)
+
+def load_data():
+    global voice_times
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            voice_times = json.load(f)
+    else:
+        voice_times = {}
+
+# ================= Botイベント =================
+@bot.event
+async def on_ready():
+    print(f"Bot起動: {bot.user}")
+    load_data()  # 起動時に保存データを読み込む
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """通話参加・退出を検知"""
+    if before.channel is None and after.channel is not None:
+        join_times[member.id] = datetime.utcnow()
+
+    elif before.channel is not None and after.channel is None:
+        if member.id in join_times:
+            join_time = join_times.pop(member.id)
+            duration = (datetime.utcnow() - join_time).total_seconds()
+            voice_times[str(member.id)] = voice_times.get(str(member.id), 0) + duration
+            save_data()  # 更新ごとに保存
+            await update_rank(member)
+
+# ================= ランク更新 =================
+async def update_rank(member):
+    """時間に応じてランクロールを付け替え"""
+    total_hours = voice_times.get(str(member.id), 0) / 3600
+    guild = member.guild
+    new_role = None
+
+    for min_h, max_h, role_id in RANKS:
+        if min_h <= total_hours < max_h:
+            new_role = guild.get_role(role_id)
+            break
+
+    # 他のランクロール削除
+    for _, _, role_id in RANKS:
+        role = guild.get_role(role_id)
+        if role in member.roles and role != new_role:
+            await member.remove_roles(role)
+
+    # 新しいランクロール付与
+    if new_role and new_role not in member.roles:
+        await member.add_roles(new_role)
+        print(f"{member.name} に {new_role.name} を付与しました！")
+
+# ================= ユーザーコマンド =================
+@bot.command()
+async def mytime(ctx):
+    """自分の累積通話時間を確認"""
+    seconds = int(voice_times.get(str(ctx.author.id), 0))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    await ctx.send(f"{ctx.author.mention} の累積通話時間: {hours}時間 {minutes}分")
+
+# ================= 毎月リセット =================
+@tasks.loop(hours=24)
+async def monthly_reset():
+    now = datetime.utcnow()
+    if now.day == 1:  # 月初
+        for guild in bot.guilds:
+            for member in guild.members:
+                for _, _, role_id in RANKS:
+                    role = guild.get_role(role_id)
+                    if role in member.roles:
+                        await member.remove_roles(role)
+        voice_times.clear()
+        save_data()  # リセット後も保存
+        print("月初のリセットを実行しました！")
+
+@monthly_reset.before_loop
+async def before_reset():
+    await bot.wait_until_ready()
+
+monthly_reset.start()
+
+# ================= Bot起動 =================
+bot.run(os.getenv("BOT_TOKEN"))  # 環境変数から取得
